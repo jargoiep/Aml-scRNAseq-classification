@@ -1,0 +1,872 @@
+---
+title: "healthy_admixture_validation_clonetracer"
+author: "Jan_B"
+date: "2025-02-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(tidyverse)
+library(RANN)
+source("/data/cephfs-1/work/projects/ag-haas-200aml/00_Scripts/04_WorkData/utility_functions/utility_func.R")
+```
+
+```{r}
+evaluate_ct_accuracy <- function(so, cell_types, variable) {
+  results_df <- data.frame(ct = character(), sens = numeric(), spec = numeric())
+  for (ct_sel in cell_types) {
+    meta_filt <- so@meta.data %>% filter(ct == ct_sel, !is.na(status), status != "unsure")
+    tp <- sum(meta_filt$status == meta_filt[, variable] & meta_filt$status == "leukemic")
+    fn <- sum(meta_filt$status == "leukemic" & meta_filt[, variable] == "healthy")
+    sens <- tp/(tp + fn)
+    # Specificity - how much healthy are predicted as healthy
+    tn <- sum(meta_filt$status ==  meta_filt[, variable] & meta_filt$status == "healthy")
+    fp <- sum(meta_filt$status == "healthy" &  meta_filt[, variable] == "leukemic")
+    spec <- tn/(tn + fp)
+    results_df <- rbind(results_df, data.frame(ct = ct_sel, sens = round(sens, 3), spec = round(spec, 3)))
+  }
+  results_df$ct <- factor(results_df$ct, levels = rev(cell_types))
+  return(results_df)
+}
+
+plot_ct_accuracy <- function(results_df) {
+  # Reshape the data to long format
+  results_df_long <- results_df %>%
+    pivot_longer(cols = 2:3, names_to = "Metric", values_to = "Value")
+  
+  ggplot(results_df_long, aes(y = ct, x = Metric, fill = Value)) +
+    # The tile layer
+    geom_tile() +
+    # A text layer with rounded values inside each tile
+    geom_text(aes(label = round(Value, 2)), color = "black") +
+    # Use a red gradient scale (white to red)
+    scale_fill_gradient(low = "white", high = "red") +
+    # A clean theme (or whichever you prefer)
+    theme_minimal()
+}
+```
+
+```{r}
+# Read in the seurat object
+so <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/04_WorkData/exploratory_analysis_0823/cluster_signature/so_signature_h_220125.RDS")
+# get clonetracer data
+so_ct <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/39014174")
+```
+
+```{r}
+# Add annotations for malignant / healthy cells
+annot_malig <-  readRDS("~/ag-haas-200aml/02_ExtraData/malignant_cell_information/malignant_info_combined.RDS")
+so <- AddMetaData(so, annot_malig)
+# Get another classification
+so$classification_combined_hr <- so@meta.data %>% mutate(classification_combined_hr = ifelse(WHO_24 == "Healthy control", "Healthy", 
+                                                                                             ifelse(classification_combined == "Malignant", "Malignant", NA))) %>% 
+  pull(classification_combined_hr)
+```
+
+```{r}
+# 1. get PCA Coordinates
+DefaultAssay(so) <- "RNA_raw"
+features <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/00_Scripts/04_WorkData/healthy_malignant_scripts/projection_data/variable_features.RDS")
+# Alternatively try to find variable features by yourself
+# so <- NormalizeData(so)
+# so <- ScaleData(so, features = features)
+# so <- RunPCA(so, npcs = 50, features = features, reduction.name = "pca")
+# ## Save embeddings
+# coords_all <- Embeddings(so, reduction = "pca")[, 1:50]
+# saveRDS(coords_all, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/healthy_admixture/pca_embeddings_all_nonintegrated.RDS")
+#loadings_all <- Loadings(so, reduction = "pca")
+#saveRDS(loadings_all, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/healthy_admixture/pca_loadings_all_nonintegrated.RDS")
+
+### loadings_all <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/healthy_admixture/pca_loadings_all_nonintegrated.RDS")
+### coords_all <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/healthy_admixture/pca_embeddings_all_nonintegrated.RDS")
+
+pca_integrated <- readRDS("pca_integrated.RDS")
+# Extract the components his code needs
+loadings_all <- pca_integrated@feature.loadings    # Instead of his non-integrated loadings
+coords_all <- pca_integrated@cell.embeddings       # Instead of his non-integrated coords
+```
+
+```{r}
+# 2. Compute nearest neighbors for all cells in the PCA space
+## Select only Malignant/Healthy and
+## subset for malignant cells to have more equal represenation
+healthy_id <- so@meta.data %>% filter(classification_combined_hr == "Healthy") %>% 
+  pull(Cohort_Run_Cell_ID)
+so_mh <- so[, so$classification_combined_hr %in% c("Malignant", "Healthy")]
+
+coords <- coords_all[rownames(coords_all) %in% colnames(so_mh), ]
+k_neighbors <- 100
+if (file.exists("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/reference_neighbors.RDS")) {
+  nn_results <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/reference_neighbors.RDS")
+} else {
+  nn_results <- nn2(data = coords, query = coords, k = k_neighbors + 1)
+  saveRDS(nn_results, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/reference_neighbors.RDS")
+}
+nn_index <- nn_results$nn.idx[, -1]   
+nn_dist  <- nn_results$nn.dists[, -1]
+
+# 3. Compute the proportion of healhty neighbors and malignant neighbors
+## Find the indices of healthy cells
+healthy_idx <- which(colnames(so_mh) %in% healthy_id)
+## Create a logical mask: Check if each value in nn_index is in healthy_idx
+nn_index_bool <- matrix(nn_index %in% healthy_idx, nrow = nrow(nn_index), ncol = ncol(nn_index))
+## Count how many TRUE values per row 
+healthy_prop <- rowSums(nn_index_bool)
+data_all <- data.frame(Cohort_Run_Cell_ID = colnames(so_mh), healthy_prop = healthy_prop) %>% 
+  mutate(Status = ifelse(Cohort_Run_Cell_ID %in% healthy_id, "Healthy", "Malignant"))
+```
+
+```{r}
+## 4. Train the model
+## Create a training set and testing set of malignant / healthy cells
+data_all <- mutate(data_all, Status = factor(Status, levels = c("Healthy", "Malignant")))
+model_glm <- glm(Status ~ healthy_prop, data = data_all, family = "binomial")
+```
+
+```{r}
+# Select coordinates for reference
+coords_ref <- coords_all[colnames(so_mh), ]
+```
+
+
+```{r}
+# 2) Prepare new_obj data
+# Subset new_obj expression data to the same variable features
+common_features <- features
+## Normalize and scale the data for extraction
+so_ct <- NormalizeData(so_ct)
+so_ct <- ScaleData(so_ct, features = common_features)
+new_data_scaled <- so_ct@assays$RNA@scale.data
+
+# 3) Project new data onto old PCA
+old_pca_loadings_ni <- loadings_all
+new_data_scaled_ord <- new_data_scaled[common_features, ]
+# The projected PCA coordinates of new cells:
+new_pca_projected <- t(old_pca_loadings_ni) %*% new_data_scaled_ord  # result: [PCs x cells_new]
+# Let's transpose so that each row = cell, each column = PC
+new_pca_projected <- t(new_pca_projected)  # [cells_new x PCs]
+
+# 4) Find nearest neighbors to determine cell-state 
+k_neighbors <- 20
+
+if (file.exists("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_all_neighbors.RDS")) {
+  nn_result <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_all_neighbors.RDS")
+} else {
+  nn_result <- nn2(
+    data  = coords_all,
+    query = new_pca_projected,
+    k     = k_neighbors
+  )
+  saveRDS(nn_result, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_all_neighbors.RDS")
+}
+
+# nn_result$nn.idx is a matrix of indices (rows correspond to each new cell,
+# columns correspond to the top k neighbors in old_obj)
+neighbor_indices <- nn_result$nn.idx
+# nn_result$nn.dists is a matrix of distances (same shape)
+neighbor_distances <- nn_result$nn.dists
+
+# 5) Assign metadata of cell states
+metadata <- so@meta.data
+
+# Predict cell state
+predicted_state <- apply(
+  X      = neighbor_indices,
+  MARGIN = 1,  # for each new cell
+  FUN    = function(nn_idx_vec) {
+    # Extract the neighbor states
+    neighbor_var <- metadata[nn_idx_vec, "uns_cluster_merged"]
+    # Simple majority vote (or could do weighted vote by distance)
+    most_common_type <- names(which.max(table(neighbor_var)))
+    
+    # Extract umap coord
+    neighbor_umap <- metadata[nn_idx_vec, c("umapx_integrated", "umapy_integrated")]
+    umapx <- mean(neighbor_umap$umapx_integrated, na.rm = TRUE)
+    umapy <- mean(neighbor_umap$umapy_integrated, na.rm = TRUE)
+    
+    # Return state and umap coordinates
+    return(list("uns_cluster_merged" = most_common_type, "umapx_integrated" = umapx, "umapy_integrated" = umapy))
+  }
+)
+
+metadata_new <- do.call(rbind, predicted_state)
+rownames(metadata_new) <- rownames(new_pca_projected)
+metadata_new <- as.data.frame(metadata_new)
+
+# Store predictions in new_obj metadata
+so_ct@meta.data$uns_cluster_merged <-  metadata_new$uns_cluster_merged
+so_ct@meta.data$umapx_integrated <-  as.numeric(metadata_new$umapx_integrated)
+so_ct@meta.data$umapy_integrated <-  as.numeric(metadata_new$umapy_integrated)
+```
+
+```{r, fig.height=8, fig.width=10}
+# Plot cells on their new umap with annotations
+ggplot(so_ct@meta.data, mapping = aes(x = umapx_integrated, y = umapy_integrated)) +
+  geom_point(data = so@meta.data, color = "grey") +
+  geom_point(mapping = aes(color = status), size = 1) +
+  theme_classic() +
+  theme_umap +
+  scale_color_brewer(palette = "Set1") +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) 
+```
+
+```{r, fig.height=30, fig.width=25}
+# Plot cells on their new umap with annotations
+ggplot(so_ct@meta.data, mapping = aes(x = umapx_integrated, y = umapy_integrated)) +
+  geom_point(mapping = aes(color = status), size = 1) +
+  theme_classic() +
+  scale_color_brewer(palette = "Set1") +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) +
+  facet_wrap(~patient, ncol = 4)
+```
+
+
+```{r}
+# Look for nearest neighbors in the healthy X malignant reference
+if (file.exists("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_reference_neighbors.RDS")) {
+  nn_result_ref <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_reference_neighbors.RDS")
+} else {
+  nn_result_ref <- nn2(
+    data  = coords_ref,
+    query = new_pca_projected,
+    k     = 100
+  )
+  saveRDS(nn_result_ref, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/ct_reference_neighbors.RDS")
+}
+
+## Extract the indices of the neighbors (N x k)
+nn_index_100 <- nn_result_ref$nn.idx
+## Create a logical mask for which neighbor indices fall into the "healthy" set
+nn_index_bool <- matrix(
+  nn_index_100 %in% healthy_idx, 
+  nrow = nrow(nn_index_100), 
+  ncol = ncol(nn_index_100)
+)
+## Count how many TRUEs in each row => how many healthy neighbors for each query cell.
+healthy_count <- rowSums(nn_index_bool)
+# Combine into a results data frame
+prop_results <- data.frame(
+  cell_ID = colnames(so_ct),
+  healthy_prop  = healthy_count
+  #,uns_cluster_merged = so_ct$uns_cluster_merged
+)
+prop_results$predicted_status <- ifelse(predict(model_glm, newdata = prop_results, type = "response") < 0.5,
+                               "Healthy", "Malignant")
+```
+
+```{r}
+# Compute the accuracy metrics and visualize the metrics
+## Assign it to the seurat object metadata
+rownames(prop_results) <- prop_results$cell_ID
+prop_results <- prop_results %>% dplyr::select(healthy_prop, predicted_status) %>% 
+  mutate(predicted_status = ifelse(predicted_status == "Healthy", "healthy", "leukemic"))
+so_ct <- AddMetaData(so_ct, prop_results)
+
+## Get contingency table
+table(so_ct$status, so_ct$predicted_status)
+```
+
+```{r}
+results <- evaluate_ct_accuracy(so_ct, cell_types = c("HSCs & MPPs", "Early promyelocytes", "Late promyelocytes", 
+"Myelocytes", "Classical Monocytes", "Non-classical monocytes", 
+"Erythro-myeloid progenitors", "Early erythroid progenitor", 
+"Late erythroid progenitor", "Aberrant erythroid", "Eosinophil-basophil-mast cell progenitors", 
+"Megakaryocyte progenitors", "Lymphomyeloid prog"), variable = "predicted_status")
+
+plot_ct_accuracy(results)
+```
+
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells
+meta_filt <- so_ct@meta.data %>% filter(status != "unsure")
+## Acc
+acc <- sum(meta_filt$status == meta_filt$predicted_status)/nrow(meta_filt)
+acc
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status == "healthy")
+sens <- tp/(tp + fn)
+sens
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status == "leukemic")
+spec <- tn/(tn + fp)
+spec
+```
+
+```{r}
+## Enrichment functions
+# 2) Define a function to get borderline counts quickly
+fast_borderline_count <- function(
+    n_total, 
+    p_healthy, 
+    alpha = 0.05, 
+    side = "greater"
+) {
+  # Degenerate cases
+  if (p_healthy <= 0 || n_total == 0) {
+    # If expected fraction = 0 or no cells => cannot find a borderline
+    return(NA_integer_)
+  } else if (p_healthy >= 1) {
+    # If expected fraction = 1 => also degenerate
+    return(NA_integer_)
+  }
+  
+  if (side == "greater") {
+    # For "greater", qbinom(1 - alpha) is the largest count c
+    # for which pbinom(c, n, p) <= 1 - alpha => borderline = c + 1
+    # Then we verify pbinom(c+1 - 1) = pbinom(c, ...) => p-value < alpha
+    c <- qbinom(1 - alpha, size = n_total, prob = p_healthy)
+    borderline <- c + 1
+    
+    if (borderline > n_total) {
+      # means even the maximum count isn't significant
+      return(NA_integer_)
+    }
+    # p-value = 1 - pbinom(borderline - 1, ...)
+    p_val_borderline <- 1 - pbinom(borderline - 1, size = n_total, prob = p_healthy)
+    
+    if (p_val_borderline < alpha) {
+      return(borderline)
+    } else {
+      return(NA_integer_)
+    }
+    
+  } else {
+    # side == "less"
+    # For "less", qbinom(alpha) is the *smallest* count c
+    # for which pbinom(c, n, p) >= alpha => borderline = c - 1
+    # Then we check if pbinom(borderline) < alpha
+    c <- qbinom(alpha, size = n_total, prob = p_healthy)
+    borderline <- c - 1
+    
+    if (borderline < 0) {
+      # means even zero cells can't achieve p < alpha
+      return(NA_integer_)
+    }
+    p_val_borderline <- pbinom(borderline, size = n_total, prob = p_healthy)
+    
+    if (p_val_borderline < alpha) {
+      return(borderline)
+    } else {
+      return(NA_integer_)
+    }
+  }
+}
+
+# 3) A function to do the analysis for a single AML sample, vectorized
+analyze_da_for_aml_sample <- function(aml_sample_id, aml_annot, df_healthy_counts) {
+  # Count how many cells in each cluster for this sample
+  df_aml_sample_counts <- aml_annot %>%
+    filter(patient == aml_sample_id) %>%
+    group_by(uns_cluster_merged) %>%
+    summarise(n_aml = n(), .groups = "drop")
+  
+  total_aml_cells <- sum(df_aml_sample_counts$n_aml)
+  
+  # Merge with healthy distribution
+  df_compare <- df_aml_sample_counts %>%
+    full_join(df_healthy_counts, by = "uns_cluster_merged") %>%
+    mutate(
+      n_aml = ifelse(is.na(n_aml), 0, n_aml),
+      cluster_perc_mean_h = ifelse(is.na(cluster_perc_mean_h), 0, cluster_perc_mean_h),
+      observed_frac = n_aml / total_aml_cells
+    )
+  
+  # 4) Vectorized "greater" p-value for enrichment
+  # p-value = P(X >= n_aml) = 1 - pbinom(n_aml - 1)
+  # handle the edge case n_aml=0 carefully
+  obs_count_vec <- df_compare$n_aml
+  p_healthy_vec <- df_compare$cluster_perc_mean_h
+  
+  p_val_enrich <- ifelse(
+    obs_count_vec > 0,
+    1 - pbinom(obs_count_vec - 1, size = total_aml_cells, prob = p_healthy_vec),
+    1 - pbinom(-1, size = total_aml_cells, prob = p_healthy_vec)  # pbinom(-1,...) = 0
+  )
+  
+  # Fix p-values if p_healthy=0 => can't do a real test
+  p_val_enrich[p_healthy_vec == 0] <- NA
+  
+  # Adjust p-values
+  p_adj_enrich <- p.adjust(p_val_enrich, method = "BH")
+  
+  # 5) Borderline counts for enrichment/depletion
+  borderline_enrich <- mapply(
+    fast_borderline_count, 
+    n_total = total_aml_cells, 
+    p_healthy = p_healthy_vec, 
+    MoreArgs = list(alpha = 0.05, side = "greater")
+  )
+  borderline_deplete <- mapply(
+    fast_borderline_count, 
+    n_total = total_aml_cells, 
+    p_healthy = p_healthy_vec, 
+    MoreArgs = list(alpha = 0.05, side = "less")
+  )
+  
+  # 6) Assemble final data frame
+  df_out <- data.frame(
+    patient = aml_sample_id,
+    uns_cluster_merged = df_compare$uns_cluster_merged,
+    observed = df_compare$n_aml,
+    total = total_aml_cells,
+    expected_frac = df_compare$cluster_perc_mean_h,
+    observed_frac = df_compare$observed_frac,
+    p_value_enrich = p_val_enrich,
+    p_adj_enrich   = p_adj_enrich,
+    borderline_enrichment_count = borderline_enrich,
+    borderline_depletion_count  = borderline_deplete
+  )
+  
+  return(df_out)
+}
+```
+
+
+```{r}
+# Compute Healthy enrichment and correct the prediction
+df_healthy_counts <- so@meta.data %>%
+  filter(WHO_24 == "Healthy control", CD34_enriched == TRUE) %>%
+  group_by(RhapsodyID) %>%
+  mutate(n_healthy = n()) %>%
+  group_by(uns_cluster_merged, RhapsodyID) %>%
+  mutate(cluster_n = n(),
+         cluster_perc = cluster_n / n_healthy) %>%
+  dplyr::select(RhapsodyID, uns_cluster_merged, cluster_n, cluster_perc) %>%
+  group_by(uns_cluster_merged) %>%
+  dplyr::summarise(cluster_perc_mean_h = mean(cluster_perc), .groups = "drop")
+
+## Take only the healhty-like cells 
+healthy_cells <- so_ct@meta.data %>% filter(predicted_status == "healthy") %>% 
+  mutate(uns_cluster_merged = as.numeric(uns_cluster_merged))
+aml_sample_ids <- unique(so_ct@meta.data$patient)
+
+df_all_aml_results_healthylike <- do.call(
+  rbind, 
+  lapply(aml_sample_ids, analyze_da_for_aml_sample,
+         aml_annot = healthy_cells,
+         df_healthy_counts = df_healthy_counts)
+)
+
+head(df_all_aml_results_healthylike)
+## Compute enrichment for each cluster
+df_all_aml_results_healthylike <- mutate(df_all_aml_results_healthylike, enriched_cell_n = observed - borderline_enrichment_count)
+
+# Select clusters that are highly enriched p < 0.001 and if healthy - assign as malignant
+so_ct$cell_ID <- colnames(so_ct)
+enrich_annot <- df_all_aml_results_healthylike %>% dplyr::select(patient, p_adj_enrich, uns_cluster_merged)
+cell_sample <- so_ct@meta.data %>% dplyr::select(patient, cell_ID, uns_cluster_merged)
+enrich_annot <- merge(cell_sample, enrich_annot, by = c("patient", "uns_cluster_merged"))
+rownames(enrich_annot) <- enrich_annot$cell_ID
+enrich_annot <- enrich_annot %>% dplyr::select(-cell_ID, -patient, -uns_cluster_merged)
+# Set p value to 1 if NA
+enrich_annot <- enrich_annot %>% mutate(p_adj_enrich = ifelse(is.na(p_adj_enrich), 1, p_adj_enrich))
+# Add the annotation
+so_ct <- AddMetaData(so_ct, enrich_annot)
+so_ct$predicted_status_enrich_cor <- so_ct@meta.data %>% 
+  mutate(predicted_status_enrich_cor = ifelse(!uns_cluster_merged %in% c(0, 4, 6, 7, 9, 16, 33, 39) & predicted_status == "healthy" & p_adj_enrich < 0.0001, "leukemic", predicted_status)) %>% 
+  pull(predicted_status_enrich_cor)
+```
+
+
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells after enrichment correction
+meta_filt <- so_ct@meta.data %>% filter(status != "unsure")
+## Acc
+acc_cor <- sum(meta_filt$status == meta_filt$predicted_status_enrich_cor)/nrow(meta_filt)
+acc_cor
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status_enrich_cor & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status_enrich_cor == "healthy")
+sens_cor <- tp/(tp + fn)
+sens_cor
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status_enrich_cor & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status_enrich_cor == "leukemic")
+spec_cor <- tn/(tn + fp)
+spec_cor
+```
+
+
+```{r}
+# Try cell state correction
+## train the model on cell state also
+data_all <- mutate(data_all, uns_cluster_merged = so_mh$uns_cluster_merged)
+model_glm_state <- glm(Status ~ healthy_prop + uns_cluster_merged, data = data_all, family = "binomial")
+prop_results <- data.frame(
+  cell_ID = colnames(so_ct),
+  healthy_prop  = healthy_count,
+  uns_cluster_merged = as.numeric(so_ct$uns_cluster_merged)
+)
+prop_results$predicted_status_state <- ifelse(predict(model_glm_state, newdata = prop_results, type = "response") < 0.5,
+                               "Healthy", "Malignant")
+
+# Compute the accuracy metrics and visualize the metrics
+## Assign it to the seurat object metadata
+rownames(prop_results) <- prop_results$cell_ID
+prop_results <- prop_results %>% dplyr::select(uns_cluster_merged, predicted_status_state) %>% 
+  mutate(predicted_status_state = ifelse(predicted_status_state == "Healthy", "healthy", "leukemic"))
+so_ct <- AddMetaData(so_ct, prop_results)
+
+## Get contingency table
+table(so_ct$status, so_ct$predicted_status_state)
+```
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells
+meta_filt <- so_ct@meta.data %>% filter(status != "unsure")
+## Acc
+acc_state <- sum(meta_filt$status == meta_filt$predicted_status_state)/nrow(meta_filt)
+acc_state
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status_state & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status_state == "healthy")
+sens_state <- tp/(tp + fn)
+sens_state
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status_state & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status_state == "leukemic")
+spec_state <- tn/(tn + fp)
+spec_state
+```
+
+```{r}
+# Create UMAP with four classes = MalignantXHealthy
+so_ct$status_comp_non_enrich <- so_ct@meta.data %>% 
+  mutate(status_comp = case_when(predicted_status_state == "leukemic" & status == "leukemic" ~ "ct_leukemic_X_pred_leukemic",
+                                 predicted_status_state == "leukemic" & status == "healthy" ~ "ct_healthy_X_pred_leukemic",
+                                 predicted_status_state == "healthy" & status == "leukemic" ~ "ct_leukemic_X_pred_healthy",
+                                 predicted_status_state == "healthy" & status == "healthy" ~ "ct_healthy_X_pred_healthy",
+                                 .default = "other")) %>% 
+  pull(status_comp)
+```
+
+
+```{r, fig.height=7, fig.width=10}
+# filter for cells with values
+meta_values <- so_ct@meta.data %>% filter(status_comp_non_enrich != "other")
+ggplot(meta_values, mapping = aes(x = umapx_integrated, y = umapy_integrated, color = status_comp_non_enrich)) +
+  geom_point(size = 0.2) +
+  theme_classic() +
+  guides(colour=guide_legend(ncol = 1, override.aes = list(size=2))) +
+  theme_umap +
+  ggtitle(paste0("Malig sensitivity: ", round(sens_state, 3), "; Malig specificity: ", round(spec_state, 3))) +
+  scale_color_manual(values = c("ct_leukemic_X_pred_leukemic" = "#4DAF4A", "ct_healthy_X_pred_leukemic" = "#E41A1C", "ct_leukemic_X_pred_healthy" = "#FF7F00", "ct_healthy_X_pred_healthy" = "#377EB8")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) 
+```
+
+```{r}
+ct_sel <- c("HSCs & MPPs", "Early promyelocytes", "Late promyelocytes", 
+"Myelocytes", "Classical Monocytes", "Non-classical monocytes", 
+"Erythro-myeloid progenitors", "Early erythroid progenitor", 
+"Late erythroid progenitor", "Aberrant erythroid", "Eosinophil-basophil-mast cell progenitors", 
+"Megakaryocyte progenitors", "Lymphomyeloid prog")
+
+results <- evaluate_ct_accuracy(so_ct, cell_types = ct_sel, variable = "predicted_status_state")
+
+meta_filt <- so_ct@meta.data %>% filter(ct %in% ct_sel) %>% 
+  mutate(ct = factor(ct, levels = ct_sel))
+
+table(meta_filt$ct, meta_filt$status)
+
+plot_ct_accuracy(results)
+```
+
+# Correct the state predicted status
+```{r}
+## Take only the healhty-like cells 
+healthy_cells <- so_ct@meta.data %>% filter(predicted_status_state == "healthy") %>% 
+  mutate(uns_cluster_merged = as.numeric(uns_cluster_merged))
+aml_sample_ids <- unique(so_ct@meta.data$patient)
+
+df_all_aml_results_healthylike <- do.call(
+  rbind, 
+  lapply(aml_sample_ids, analyze_da_for_aml_sample,
+         aml_annot = healthy_cells,
+         df_healthy_counts = df_healthy_counts)
+)
+
+head(df_all_aml_results_healthylike)
+## Compute enrichment for each cluster
+df_all_aml_results_healthylike <- mutate(df_all_aml_results_healthylike, enriched_cell_n = observed - borderline_enrichment_count)
+
+# Select clusters that are highly enriched p < 0.001 and if healthy - assign as malignant
+so_ct$cell_ID <- colnames(so_ct)
+enrich_annot <- df_all_aml_results_healthylike %>% dplyr::select(patient, p_adj_enrich, uns_cluster_merged)
+cell_sample <- so_ct@meta.data %>% dplyr::select(patient, cell_ID, uns_cluster_merged)
+enrich_annot <- merge(cell_sample, enrich_annot, by = c("patient", "uns_cluster_merged"))
+rownames(enrich_annot) <- enrich_annot$cell_ID
+enrich_annot <- enrich_annot %>% dplyr::select(-cell_ID, -patient, -uns_cluster_merged)
+# Set p value to 1 if NA
+enrich_annot <- enrich_annot %>% mutate(p_adj_enrich = ifelse(is.na(p_adj_enrich), 1, p_adj_enrich))
+# Add the annotation
+so_ct <- AddMetaData(so_ct, enrich_annot)
+so_ct$predicted_status_state_enrich_cor <- so_ct@meta.data %>% 
+  mutate(predicted_status_state_enrich_cor = ifelse(!uns_cluster_merged %in% c(0, 4, 6, 7, 9, 16, 33, 39) & predicted_status_state == "healthy" & p_adj_enrich < 0.0001, "leukemic", predicted_status_state)) %>% 
+  pull(predicted_status_state_enrich_cor)
+```
+
+
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells after enrichment correction
+meta_filt <- so_ct@meta.data %>% filter(status != "unsure")
+## Acc
+acc_state_cor <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor)/nrow(meta_filt)
+acc_state_cor
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status_state_enrich_cor == "healthy")
+sens_state_cor <- tp/(tp + fn)
+sens_state_cor
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status_state_enrich_cor == "leukemic")
+spec_state_cor <- tn/(tn + fp)
+spec_state_cor
+```
+
+## Make visualizations to present the points
+
+```{r}
+# Create UMAP with four classes = MalignantXHealthy
+so_ct$status_comp <- so_ct@meta.data %>% 
+  mutate(status_comp = case_when(predicted_status_state_enrich_cor == "leukemic" & status == "leukemic" ~ "ct_leukemic_X_pred_leukemic",
+                                 predicted_status_state_enrich_cor == "leukemic" & status == "healthy" ~ "ct_healthy_X_pred_leukemic",
+                                 predicted_status_state_enrich_cor == "healthy" & status == "leukemic" ~ "ct_leukemic_X_pred_healthy",
+                                 predicted_status_state_enrich_cor == "healthy" & status == "healthy" ~ "ct_healthy_X_pred_healthy",
+                                 .default = "other")) %>% 
+  pull(status_comp)
+```
+
+
+```{r, fig.height=7, fig.width=10}
+# filter for cells with values
+meta_values <- so_ct@meta.data %>% filter(status_comp != "other")
+ggplot(meta_values, mapping = aes(x = umapx_integrated, y = umapy_integrated, color = status_comp)) +
+  geom_point(size = 0.2) +
+  theme_classic() +
+  guides(colour=guide_legend(ncol = 1, override.aes = list(size=2))) +
+  theme_umap +
+  ggtitle(paste0("Malig sensitivity: ", round(sens_state_cor, 3), "; Malig specificity: ", round(spec_state_cor, 3))) +
+  scale_color_manual(values = c("ct_leukemic_X_pred_leukemic" = "#4DAF4A", "ct_healthy_X_pred_leukemic" = "#E41A1C", "ct_leukemic_X_pred_healthy" = "#FF7F00", "ct_healthy_X_pred_healthy" = "#377EB8")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) 
+```
+
+```{r}
+results_enrich <- evaluate_ct_accuracy(so_ct, cell_types = c("HSCs & MPPs", "Early promyelocytes", "Late promyelocytes", 
+"Myelocytes", "Classical Monocytes", "Non-classical monocytes", 
+"Erythro-myeloid progenitors", "Early erythroid progenitor", 
+"Late erythroid progenitor", "Aberrant erythroid", "Eosinophil-basophil-mast cell progenitors", 
+"Megakaryocyte progenitors", "Lymphomyeloid prog"), variable = "predicted_status_state_enrich_cor")
+
+plot_ct_accuracy(results_enrich)
+```
+
+```{r, fig.height=25, fig.width=25}
+ggplot(meta_values, mapping = aes(x = umapx_integrated, y = umapy_integrated, color = status_comp)) +
+  geom_point(size = 0.2) +
+  theme_classic() +
+  guides(colour=guide_legend(ncol = 1, override.aes = list(size=2))) +
+  theme_umap +
+  ggtitle(paste0("Malig sensitivity: ", round(sens_state_cor, 3), "; Malig specificity: ", round(spec_state_cor, 3))) +
+  scale_color_manual(values = c("ct_leukemic_X_pred_leukemic" = "#4DAF4A", "ct_healthy_X_pred_leukemic" = "#E41A1C", "ct_leukemic_X_pred_healthy" = "#FF7F00", "ct_healthy_X_pred_healthy" = "#377EB8")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) +
+  facet_wrap(~patient, scales = "fixed")
+```
+
+```{r}
+# Save InterMediate Results
+saveRDS(so_ct, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/clonetracer_malignant_predicted_validation.RDS")
+rm(so_ct)
+```
+
+## Investigate the results from scmap
+
+```{r}
+so_ct_scmap <- readRDS("/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/clonetracer_malignant_annotated_v3.RDS")
+```
+
+```{r, fig.height=7, fig.width=9}
+DimPlot(so_ct_scmap, reduction = "projected_aml", group.by = "malig_classification", raster = FALSE) +
+  theme_umap
+```
+
+```{r, fig.height=30, fig.width=25}
+# Plot cells on their new umap with annotations
+ggplot(so_ct_scmap@meta.data, mapping = aes(x = umapx_aml_projected, y = umapy_aml_projected)) +
+  geom_point(mapping = aes(color = malig_classification), size = 1) +
+  theme_classic() +
+  scale_color_brewer(palette = "Set1") +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) +
+  facet_wrap(~patient, ncol = 4)
+```
+
+# Evaluate the accuracy
+
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells
+so_ct_scmap$predicted_status_state <- so_ct_scmap@meta.data  %>% 
+  mutate(predicted_status_state = ifelse(malig_classification == "Malignant", "leukemic", "healthy")) %>% 
+  pull(predicted_status_state)
+meta_filt <- so_ct_scmap@meta.data %>% filter(status != "unsure")
+## Acc
+acc_state <- sum(meta_filt$status == meta_filt$predicted_status_state)/nrow(meta_filt)
+acc_state
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status_state & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status_state == "healthy")
+sens_state <- tp/(tp + fn)
+sens_state
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status_state & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status_state == "leukemic")
+spec_state <- tn/(tn + fp)
+spec_state
+```
+
+```{r}
+# Create UMAP with four classes = MalignantXHealthy
+so_ct_scmap$status_comp <- so_ct_scmap@meta.data %>% 
+  mutate(status_comp = case_when(predicted_status_state == "leukemic" & status == "leukemic" ~ "ct_leukemic_X_pred_leukemic",
+                                 predicted_status_state == "leukemic" & status == "healthy" ~ "ct_healthy_X_pred_leukemic",
+                                 predicted_status_state == "healthy" & status == "leukemic" ~ "ct_leukemic_X_pred_healthy",
+                                 predicted_status_state == "healthy" & status == "healthy" ~ "ct_healthy_X_pred_healthy",
+                                 .default = "other")) %>% 
+  pull(status_comp)
+```
+
+
+```{r, fig.height=7, fig.width=10}
+# filter for cells with values
+meta_values <- so_ct_scmap@meta.data %>% filter(status_comp != "other")
+ggplot(meta_values, mapping = aes(x = umapx_aml_projected, y = umapy_aml_projected, color = status_comp)) +
+  geom_point(size = 0.2) +
+  theme_classic() +
+  guides(colour=guide_legend(ncol = 1, override.aes = list(size=2))) +
+  theme_umap +
+  ggtitle(paste0("Malig sensitivity: ", round(sens_state, 3), "; Malig specificity: ", round(spec_state, 3))) +
+  scale_color_manual(values = c("ct_leukemic_X_pred_leukemic" = "#4DAF4A", "ct_healthy_X_pred_leukemic" = "#E41A1C", "ct_leukemic_X_pred_healthy" = "#FF7F00", "ct_healthy_X_pred_healthy" = "#377EB8")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) 
+```
+
+```{r}
+results_scmap_enrich <- evaluate_ct_accuracy(so_ct_scmap, cell_types = c("HSCs & MPPs", "Early promyelocytes", "Late promyelocytes", 
+"Myelocytes", "Classical Monocytes", "Non-classical monocytes", 
+"Erythro-myeloid progenitors", "Early erythroid progenitor", 
+"Late erythroid progenitor", "Aberrant erythroid", "Eosinophil-basophil-mast cell progenitors", 
+"Megakaryocyte progenitors", "Lymphomyeloid prog"), variable = "predicted_status_state")
+
+plot_ct_accuracy(results_scmap_enrich)
+```
+
+# Evaluate accuarcy with CD34 enrichemnt percentages
+
+# Correct the state predicted status
+```{r}
+df_healthy_counts <- so@meta.data %>%
+  filter(WHO_24 == "Healthy control", CD34_enriched == TRUE) %>%
+  group_by(RhapsodyID) %>%
+  mutate(n_healthy = n()) %>%
+  group_by(uns_cluster_merged, RhapsodyID) %>%
+  mutate(cluster_n = n(),
+         cluster_perc = cluster_n / n_healthy) %>%
+  dplyr::select(RhapsodyID, uns_cluster_merged, cluster_n, cluster_perc) %>%
+  group_by(uns_cluster_merged) %>%
+  dplyr::summarise(cluster_perc_mean_h = mean(cluster_perc), .groups = "drop")
+
+## Take only the healhty-like cells 
+healthy_cells <- so_ct_scmap@meta.data %>% filter(predicted_status_state == "healthy") %>% 
+  mutate(uns_cluster_merged = as.numeric(projected.uns_cluster_merged))
+aml_sample_ids <- unique(so_ct_scmap@meta.data$patient)
+
+df_all_aml_results_healthylike <- do.call(
+  rbind, 
+  lapply(aml_sample_ids, analyze_da_for_aml_sample,
+         aml_annot = healthy_cells,
+         df_healthy_counts = df_healthy_counts)
+)
+
+head(df_all_aml_results_healthylike)
+## Compute enrichment for each cluster
+df_all_aml_results_healthylike <- mutate(df_all_aml_results_healthylike, enriched_cell_n = observed - borderline_enrichment_count)
+
+# Select clusters that are highly enriched p < 0.001 and if healthy - assign as malignant
+so_ct_scmap$uns_cluster_merged <- so_ct_scmap$projected.uns_cluster_merged
+so_ct_scmap$cell_ID <- colnames(so_ct_scmap)
+enrich_annot <- df_all_aml_results_healthylike %>% dplyr::select(patient, p_adj_enrich, uns_cluster_merged)
+cell_sample <- so_ct_scmap@meta.data %>% dplyr::select(patient, cell_ID, uns_cluster_merged)
+enrich_annot <- merge(cell_sample, enrich_annot, by = c("patient", "uns_cluster_merged"))
+rownames(enrich_annot) <- enrich_annot$cell_ID
+enrich_annot <- enrich_annot %>% dplyr::select(-cell_ID, -patient, -uns_cluster_merged)
+# Set p value to 1 if NA
+enrich_annot <- enrich_annot %>% mutate(p_adj_enrich = ifelse(is.na(p_adj_enrich), 1, p_adj_enrich))
+# Add the annotation
+so_ct_scmap <- AddMetaData(so_ct_scmap, enrich_annot)
+so_ct_scmap$predicted_status_state_enrich_cor <- so_ct_scmap@meta.data %>% 
+  mutate(predicted_status_state_enrich_cor = ifelse(!uns_cluster_merged %in% c(0, 4, 6, 7, 9, 16, 33, 39) & predicted_status_state == "healthy" & p_adj_enrich < 0.0001, "leukemic", predicted_status_state)) %>% 
+  pull(predicted_status_state_enrich_cor)
+```
+
+
+```{r}
+## Compute Accuracy/sensitivity/specificity for malignant cells after enrichment correction
+meta_filt <- so_ct_scmap@meta.data %>% filter(status != "unsure")
+## Acc
+acc_state_cor <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor)/nrow(meta_filt)
+acc_state_cor
+# Sensitivity malignant - how much malignant are predicted as malignant
+tp <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor & meta_filt$status == "leukemic")
+fn <- sum(meta_filt$status == "leukemic" & meta_filt$predicted_status_state_enrich_cor == "healthy")
+sens_state_cor <- tp/(tp + fn)
+sens_state_cor
+# Specificity - how much healthy are predicted as healthy
+tn <- sum(meta_filt$status == meta_filt$predicted_status_state_enrich_cor & meta_filt$status == "healthy")
+fp <- sum(meta_filt$status == "healthy" & meta_filt$predicted_status_state_enrich_cor == "leukemic")
+spec_state_cor <- tn/(tn + fp)
+spec_state_cor
+```
+
+
+```{r}
+# Create UMAP with four classes = MalignantXHealthy
+so_ct_scmap$status_comp <- so_ct_scmap@meta.data %>% 
+  mutate(status_comp = case_when(predicted_status_state_enrich_cor == "leukemic" & status == "leukemic" ~ "ct_leukemic_X_pred_leukemic",
+                                 predicted_status_state_enrich_cor == "leukemic" & status == "healthy" ~ "ct_healthy_X_pred_leukemic",
+                                 predicted_status_state_enrich_cor == "healthy" & status == "leukemic" ~ "ct_leukemic_X_pred_healthy",
+                                 predicted_status_state_enrich_cor == "healthy" & status == "healthy" ~ "ct_healthy_X_pred_healthy",
+                                 .default = "other")) %>% 
+  pull(status_comp)
+```
+
+
+```{r, fig.height=7, fig.width=10}
+# filter for cells with values
+meta_values <- so_ct_scmap@meta.data %>% filter(status_comp != "other")
+ggplot(meta_values, mapping = aes(x = umapx_aml_projected, y = umapy_aml_projected, color = status_comp)) +
+  geom_point(size = 0.2) +
+  theme_classic() +
+  guides(colour=guide_legend(ncol = 1, override.aes = list(size=2))) +
+  theme_umap +
+  ggtitle(paste0("Malig sensitivity: ", round(sens_state_cor, 3), "; Malig specificity: ", round(spec_state_cor, 3))) +
+  scale_color_manual(values = c("ct_leukemic_X_pred_leukemic" = "#4DAF4A", "ct_healthy_X_pred_leukemic" = "#E41A1C", "ct_leukemic_X_pred_healthy" = "#FF7F00", "ct_healthy_X_pred_healthy" = "#377EB8")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14)) 
+```
+
+```{r}
+results_scmap_enrich <- evaluate_ct_accuracy(so_ct_scmap, cell_types = c("HSCs & MPPs", "Early promyelocytes", "Late promyelocytes", 
+"Myelocytes", "Classical Monocytes", "Non-classical monocytes", 
+"Erythro-myeloid progenitors", "Early erythroid progenitor", 
+"Late erythroid progenitor", "Aberrant erythroid", "Eosinophil-basophil-mast cell progenitors", 
+"Megakaryocyte progenitors", "Lymphomyeloid prog"), variable = "predicted_status_state_enrich_cor")
+
+plot_ct_accuracy(results_scmap_enrich)
+```
+
+```{r}
+saveRDS(so_ct_scmap, "/data/cephfs-1/work/projects/ag-haas-200aml/02_ExtraData/external_data/clonetracer/clonetracer_scmap_malignant_predicted_validation.RDS")
+```
+
+
+
