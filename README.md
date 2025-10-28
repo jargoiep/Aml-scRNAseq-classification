@@ -133,16 +133,6 @@ Analyzes model performance at the patient level:
 - False positive/negative rate analysis
 - Identifies patient-specific factors affecting performance
 
-### Cell Type-Specific Error Analysis
-
-**Script:** `error_analysis_by_cell_type.R`
-
-Analyzes error distribution across cell types: 
-- HSCs (hematopoietic stem cells) 
-- Monocytes, erythroid cells
-- T-cells, B-cells, NK-cells
-- Myeloid progenitors, dendritic cells - Visualizes cell count distributions per type
-
 ### Validation Scripts
 
 **Script:** `sanity_check_malignant_immune_cells.R`
@@ -257,9 +247,6 @@ Rscript SVM_17gene_with_imputation.R
 ``` bash
 # Patient-level analysis
 Rscript patient_misclassification_analysis.R
-
-# Cell-type specific analysis
-Rscript error_analysis_by_cell_type.R
 
 # Validation checks
 Rscript sanity_check_malignant_immune_cells.R
